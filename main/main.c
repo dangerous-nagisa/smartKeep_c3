@@ -24,6 +24,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -46,6 +47,7 @@ static const char *TAG = "smartKeep";
 #define I2C_SDA_PIN GPIO_NUM_4
 #define I2C_SCL_PIN GPIO_NUM_5
 #define BMI270_I2C_ADDR 0x68
+#define BUZZER_PIN GPIO_NUM_6       // 低电平有源蜂鸣器
 
 /* --- 传感器量程 --- */
 #define ACC_RANGE_G 4.0f      // ±4 g
@@ -464,6 +466,70 @@ static void udp_tx_task(void *arg)
 }
 
 // =============================================================================
+// § 10.5  蜂鸣器驱动 (低电平有源蜂鸣器, GPIO6)
+//
+//   LOW  = 响
+//   HIGH = 停
+// =============================================================================
+
+/**
+ * @brief 初始化蜂鸣器 GPIO (默认关闭)
+ */
+static void buzzer_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BUZZER_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(BUZZER_PIN, 1);  // 默认高电平 = 关闭
+}
+
+/** 蜂鸣器开 */
+static inline void buzzer_on(void)
+{
+    gpio_set_level(BUZZER_PIN, 0);
+}
+
+/** 蜂鸣器关 */
+static inline void buzzer_off(void)
+{
+    gpio_set_level(BUZZER_PIN, 1);
+}
+
+/**
+ * @brief 蜂鸣器短响 (阻塞)
+ * @param ms 持续时间 (毫秒)
+ */
+static void buzzer_beep(uint32_t ms)
+{
+    buzzer_on();
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    buzzer_off();
+}
+
+/**
+ * @brief 蜂鸣器连续短响 (阻塞)
+ * @param count    响几次
+ * @param on_ms    每次响的时长
+ * @param off_ms   间隔时长
+ */
+static void buzzer_beep_n(int count, uint32_t on_ms, uint32_t off_ms)
+{
+    for (int i = 0; i < count; i++) {
+        buzzer_on();
+        vTaskDelay(pdMS_TO_TICKS(on_ms));
+        buzzer_off();
+        if (i < count - 1) {
+            vTaskDelay(pdMS_TO_TICKS(off_ms));
+        }
+    }
+}
+
+// =============================================================================
 // § 11  I2C 总线初始化
 // =============================================================================
 
@@ -617,6 +683,7 @@ static void imu_task(void *arg)
     }
     ESP_LOGI(TAG, "校准完成  bias=(%.3f, %.3f, %.3f) °/s",
              bias_gx, bias_gy, bias_gz);
+    buzzer_beep_n(2, 50, 50);  // 校准完成: 嘀嘀两声
 
     /* 重置时间戳 */
     t_prev = esp_timer_get_time();
@@ -779,6 +846,10 @@ static void imu_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "========== smartKeep 姿态节点启动 ==========");
+
+    /* 0. 蜂鸣器初始化 + 启动提示音 */
+    buzzer_init();
+    buzzer_beep(100);
 
     /* 1. NVS 初始化 (WiFi + 节点配置 依赖) */
     esp_err_t ret = nvs_flash_init();

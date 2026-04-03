@@ -54,7 +54,7 @@ graph TB
 | **GPIO2** | 电池电压采样 | ADC 输入 | Strapping 引脚，仅输入 |
 | **GPIO4** | I2C SDA | 数据线 | BMI270 |
 | **GPIO5** | I2C SCL | 时钟线 | BMI270 |
-| **GPIO6** | 蜂鸣器 | PWM 输出 | TODO |
+| **GPIO6** | 蜂鸣器 | GPIO 输出 | 低电平有源蜂鸣器，LOW=响 HIGH=停 |
 
 > **BMI270 I2C 地址**: `0x68`（SDO→GND）或 `0x69`（SDO→VCC）
 
@@ -70,7 +70,7 @@ smartKepp_C3/
 ├── dependencies.lock
 │
 ├── main/
-│   ├── main.c                ← 完整固件 (~850行, 14个模块段)
+│   ├── main.c                ← 完整固件 (~900行, 15个模块段)
 │   ├── node_config.h         ← 节点 ID 配置 API
 │   ├── node_config.c         ← NVS 存储 + UDP 远程配置
 │   ├── CMakeLists.txt
@@ -105,6 +105,7 @@ smartKepp_C3/
 | §8 | 四元数→欧拉角 | ZYX 顺序 |
 | §9 | WiFi STA | 自动重连 + 断连原因打印 |
 | §10 | UDP 发送任务 | 队列消费 + SO_BROADCAST |
+| §10.5 | 蜂鸣器驱动 | 低电平有源，GPIO6，init/on/off/beep/beep_n |
 | §11 | I2C 初始化 | 新驱动 i2c_master.h |
 | §12 | BMI270 初始化 | 200Hz, ±4g, ±2000dps |
 | §13 | IMU 管道任务 | 校准→收敛→运行→步态检测 |

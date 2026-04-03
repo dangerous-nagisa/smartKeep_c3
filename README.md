@@ -23,6 +23,7 @@ UDP 广播 ──WiFi──► ESP32-P4 网关 ──MQTT──► 云端/PC
 - **50Hz 数据输出**: 44 字节 `node_packet_t`，CRC-8 校验
 - **WiFi UDP 广播**: 255.255.255.255:8888，P4 网关或 PC 均可接收
 - **多节点支持**: NVS 持久化节点 ID (1~5)，UDP 远程配置 (端口 8889)
+- **蜂鸣器提示**: 低电平有源驱动，上电嘀一声、校准完成嘀嘀两声
 - **零偏校准**: 上电静置 2 秒自动校准陀螺仪
 
 ## 硬件连接
@@ -32,7 +33,7 @@ UDP 广播 ──WiFi──► ESP32-P4 网关 ──MQTT──► 云端/PC
 | GPIO4 | I2C SDA | BMI270 |
 | GPIO5 | I2C SCL | BMI270 |
 | GPIO2 | ADC | 电池采样 (TODO) |
-| GPIO6 | PWM | 蜂鸣器 (TODO) |
+| GPIO6 | GPIO 输出 | 蜂鸣器 (低电平有源) |
 
 > BMI270 I2C 地址: `0x68` (SDO→GND) 或 `0x69` (SDO→VCC)
 
