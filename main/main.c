@@ -34,6 +34,7 @@
 
 #include "bmi270.h"
 #include "bmi270_interface.h"
+#include "node_config.h"
 
 static const char *TAG = "smartKeep";
 
@@ -102,9 +103,6 @@ typedef enum {
     GAIT_SWING,     // 摆动期 (脚在空中)
     GAIT_STANCE,    // 支撑期 (脚在地上)
 } gait_phase_t;
-
-/* --- 节点 --- */
-#define NODE_ID 1
 
 /* --- 数学常量 --- */
 #define DEG_TO_RAD (M_PI / 180.0f)
@@ -672,7 +670,7 @@ static void imu_task(void *arg)
         /* ---- 构建 node_packet_t ---- */
         node_packet_t pkt = {0};
 
-        pkt.node_id = NODE_ID;
+        pkt.node_id = node_config_get_id();
         pkt.battery = 0xFF; // TODO: ADC GPIO2
         pkt.seq = seq++;
         pkt.timestamp = (uint32_t)(t_now / 1000); // μs → ms
@@ -782,7 +780,7 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "========== smartKeep 姿态节点启动 ==========");
 
-    /* 1. NVS 初始化 (WiFi 依赖) */
+    /* 1. NVS 初始化 (WiFi + 节点配置 依赖) */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -791,13 +789,24 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* 2. WiFi 连接 */
-    if (wifi_sta_init() != ESP_OK)
+    /* 2. 节点 ID 配置 (从 NVS 加载) */
+    uint8_t nid = node_config_init();
+    ESP_LOGI(TAG, "节点 ID: %d", nid);
+
+    /* 3. WiFi 连接 */
+    bool wifi_ok = (wifi_sta_init() == ESP_OK);
+    if (!wifi_ok)
     {
         ESP_LOGW(TAG, "WiFi 未连接, UDP 不可用 — 仅本地串口输出");
     }
 
-    /* 3. 创建 IMU → UDP 队列 */
+    /* 4. 启动 UDP 配置监听 (远程修改 ID) */
+    if (wifi_ok)
+    {
+        node_config_start_udp_listener();
+    }
+
+    /* 5. 创建 IMU → UDP 队列 */
     g_pkt_queue = xQueueCreate(PKT_QUEUE_DEPTH, sizeof(node_packet_t));
     if (!g_pkt_queue)
     {
@@ -805,7 +814,7 @@ void app_main(void)
         return;
     }
 
-    /* 4. 启动 UDP 发送任务 */
+    /* 6. 启动 UDP 发送任务 */
     if (xTaskCreate(udp_tx_task, "udp_tx", UDP_TASK_STACK, NULL,
                     UDP_TASK_PRIO, NULL) != pdPASS)
     {
@@ -813,7 +822,7 @@ void app_main(void)
         return;
     }
 
-    /* 5. I2C 互斥锁 */
+    /* 7. I2C 互斥锁 */
     g_i2c_mutex = xSemaphoreCreateMutex();
     if (!g_i2c_mutex)
     {
@@ -821,15 +830,15 @@ void app_main(void)
         return;
     }
 
-    /* 6. I2C 总线 */
+    /* 8. I2C 总线 */
     if (i2c_bus_init() != ESP_OK)
         return;
 
-    /* 7. BMI270 初始化 + 配置 + 使能 */
+    /* 9. BMI270 初始化 + 配置 + 使能 */
     if (bmi270_hw_init() != BMI2_OK)
         return;
 
-    /* 8. 启动 IMU 管道任务 */
+    /* 10. 启动 IMU 管道任务 */
     if (xTaskCreate(imu_task, "imu", IMU_TASK_STACK, NULL,
                     IMU_TASK_PRIO, NULL) != pdPASS)
     {
@@ -837,5 +846,6 @@ void app_main(void)
         return;
     }
 
-    ESP_LOGI(TAG, "系统就绪 — IMU(50Hz) → UDP(%s:%d)", UDP_BROADCAST_IP, UDP_PORT);
+    ESP_LOGI(TAG, "系统就绪 — 节点%d IMU(50Hz) → UDP(%s:%d)",
+             node_config_get_id(), UDP_BROADCAST_IP, UDP_PORT);
 }
