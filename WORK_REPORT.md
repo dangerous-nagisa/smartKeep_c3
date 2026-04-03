@@ -943,3 +943,172 @@ nvs_close(h);
 *报告结束*
 
 ---
+
+## 2026-04-03 | P4 网关实现: UDP → MQTT 二进制帧转发
+
+### 1. 需求背景
+
+原架构 C3 直接 UDP 广播到 PC，存在限制:
+- PC 必须和节点在同一局域网
+- 无法远程监控、无法持久化到云端
+- 缺少帧聚合和事件检测能力
+
+**新架构:**
+
+```
+C3 节点 (×5) ──UDP 8888──► ESP32-P4 网关 ──MQTT──► broker.emqx.io ──► PC/服务器
+```
+
+C3 固件零改动，P4 作为网关负责 UDP 接收 → 帧聚合 → MQTT 发布。
+
+---
+
+### 2. MQTT 协议设计
+
+#### Topic 结构
+
+```
+smartkeep/{device_id}/{session_id}/{type}
+```
+
+- `device_id`: P4 MAC 后 3 字节 (如 `a1b2c3`)
+- `session_id`: 评估会话编号 (uint16 十六进制)
+- `type`: `data` / `event` / `status`
+
+#### 三类帧定义
+
+| 帧类型 | frame_type | 大小 | 频率 | QoS | 用途 |
+|:---|:---:|:---:|:---|:---:|:---|
+| 数据帧 | 0x01 | 194B | 50Hz | 0 | 5 节点聚合实时数据 |
+| 事件帧 | 0x02 | 41B | 触发式 | 1 | 步态事件 (HS/TO) |
+| 状态帧 | 0x03 | 23B | 1Hz | 1 | 网关心跳 + 节点在线 |
+
+#### 数据帧结构 (194B)
+
+```
+帧头 (12B): frame_type + node_mask + frame_seq + frame_ts + session_id + task_id
+节点数据 (180B): 5 × node_data_t (36B 每节点)
+帧尾 (2B): CRC-16/CCITT
+```
+
+`node_data_t` (36B) 包含: euler[3], accel[3], gyro_norm, jerk, step_flag, rssi, seq
+
+#### 事件帧结构 (41B)
+
+步态事件发生时触发发送，包含:
+- event_type: EVT_STEP_ON(0x01), EVT_STEP_OFF(0x02), EVT_STS_START(0x11)...
+- event_value: 事件特征值
+- euler_snap[3] + accel_snap[3]: 事件瞬间快照
+
+#### 状态帧结构 (23B)
+
+1Hz 心跳，包含: 在线节点 bitmask, 各节点电量/RSSI, P4 运行时间, MQTT 重连次数
+
+---
+
+### 3. P4 任务架构
+
+```
+Task_UDP_Recv (P24, Core0)
+  │ bind UDP :8888
+  │ recvfrom → CRC-8 校验 → ring buffer
+  ▼
+Task_Aggregator (P20, Core0)
+  │ 20ms 周期聚合所有节点最新数据
+  │ 构建 mqtt_data_frame_t
+  ▼
+Task_Algo_Engine (P16, Core1)
+  │ 1. 数据帧 → 分配序号 + CRC-16 → MQTT 队列
+  │ 2. 检测步态事件 → 事件帧 → MQTT 队列
+  │ 3. 1Hz 状态帧 → MQTT 队列
+  ▼
+Task_MQTT_Pub (P8, Core0)
+  │ esp_mqtt_client → broker.emqx.io:1883
+  │ QoS 分级: data=0, event=1, status=1
+  ▼
+broker.emqx.io
+```
+
+---
+
+### 4. 文件改动清单
+
+#### P4 项目 (smartKeep_P4)
+
+| 文件 | 操作 | 说明 |
+|:---|:---|:---|
+| `main/smartkeep_packet.h` | 新增 | 完整协议: node_packet_t + 3 类 MQTT 帧 + CRC-8/16 |
+| `main/app_tasks.h` | 重写 | IPC 消息类型 + app_session_t 会话管理 |
+| `main/app_tasks.c` | 重写 | Aggregator + Algo + device_id 初始化 |
+| `main/app_tasks_network.c` | 重写 | UDP_Recv + MQTT_Pub (esp_mqtt_client) |
+| `main/CMakeLists.txt` | 修改 | 添加 mqtt + esp_timer 依赖 |
+| `CLAUDE.md` | 更新 | 项目文档反映网关角色 |
+
+#### C3 项目 (smartKepp_C3)
+
+| 文件 | 操作 | 说明 |
+|:---|:---|:---|
+| `tools/mqtt_subscriber.py` | 新增 | PC 端 MQTT 订阅器 (paho-mqtt) |
+| `CLAUDE.md` | 更新 | 项目阶段 + 架构图 |
+
+**C3 固件代码零改动。**
+
+---
+
+### 5. 带宽估算
+
+| 帧类型 | 大小 × 频率 | 带宽 |
+|:---|:---|:---|
+| 数据帧 | 194B × 50Hz | 9.7 KB/s |
+| 事件帧 | 41B × ~2Hz | 0.08 KB/s |
+| 状态帧 | 23B × 1Hz | 0.02 KB/s |
+| **合计** | | **~10 KB/s** |
+
+QoS1 控制包开销 ×1.2 → 实际 ~12 KB/s，WiFi/4G 完全可承受。
+
+---
+
+### 6. PC 端使用
+
+```bash
+# 安装依赖
+pip install paho-mqtt
+
+# 仪表盘模式
+python tools/mqtt_subscriber.py
+
+# 原始帧打印
+python tools/mqtt_subscriber.py --raw
+
+# CSV 日志
+python tools/mqtt_subscriber.py --log
+
+# 自定义 broker
+python tools/mqtt_subscriber.py --broker 192.168.1.100 --port 1883
+```
+
+---
+
+### 7. 包大小修正说明
+
+设计文档中事件帧标注 42B、状态帧标注 22B，实际 `__attribute__((packed))` 后:
+- **事件帧**: 1+1+2+4+2+1+1+4+12+12+1 = **41B**
+- **状态帧**: 1+1+2+4+5+5+1+1+1+1+1 = **23B**
+
+已在代码中通过 `_Static_assert` 保证编译时校验。
+
+---
+
+### 8. 验证方法
+
+1. P4 编译无错误
+2. P4 串口日志: `UDP rx: N pkts` 确认收到 C3 数据
+3. MQTTX 客户端订阅 `smartkeep/#`，确认收到二进制帧
+4. `mqtt_subscriber.py` 仪表盘显示 5 节点数据
+5. 步态事件触发时，事件帧实时推送
+
+---
+
+*报告结束*
+
+---
