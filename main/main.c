@@ -63,9 +63,9 @@ static const char *TAG = "smartKeep";
 #define UDP_PORT 8888
 
 /* --- 任务参数 --- */
-#define IMU_TASK_STACK 4096
+#define IMU_TASK_STACK 8192   // C3 无 FPU，浮点运算栈消耗大
 #define IMU_TASK_PRIO 5
-#define UDP_TASK_STACK 3072
+#define UDP_TASK_STACK 6144   // 网络操作需要更多栈空间
 #define UDP_TASK_PRIO 4
 #define PKT_QUEUE_DEPTH 10    // 队列深度, 满则丢弃最新
 #define IMU_LOOP_PERIOD_MS 10 // 100 Hz 内部循环
@@ -73,7 +73,8 @@ static const char *TAG = "smartKeep";
 #define LOG_DECIMATION 50     // 每 50 包打印 1 次 → 1 Hz
 
 /* --- 零偏校准 --- */
-#define GYRO_CALIB_SAMPLES 200 // 静置采集帧数 (~2 s)
+#define GYRO_CALIB_SAMPLES 200    // 静置采集帧数 (~2 s)
+#define GYRO_CALIB_TIMEOUT_MS 5000 // 校准超时 (ms)
 
 /* --- 低通滤波系数 (0‥1, 越小越平滑) --- */
 #define LPF_ALPHA_ACC 0.3f
@@ -389,7 +390,10 @@ static esp_err_t wifi_sta_init(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* 降低 WiFi 发射功率以减少功耗峰值 (默认 20dBm → 8dBm) */
+    esp_wifi_set_max_tx_power(8);
 
     ESP_LOGI(TAG, "WiFi STA 启动, 正在连接 \"%s\" …", WIFI_SSID);
 
@@ -662,13 +666,34 @@ static void imu_task(void *arg)
     {
         float sum_gx = 0, sum_gy = 0, sum_gz = 0;
         int n = 0;
+        int fail_cnt = 0;
+        int64_t calib_start = esp_timer_get_time();
         struct bmi2_sens_data sd;
 
         while (n < GYRO_CALIB_SAMPLES)
         {
             vTaskDelayUntil(&wake, pdMS_TO_TICKS(IMU_LOOP_PERIOD_MS));
+
+            /* 超时保护：避免无限阻塞触发看门狗 */
+            if ((esp_timer_get_time() - calib_start) > (GYRO_CALIB_TIMEOUT_MS * 1000LL))
+            {
+                ESP_LOGE(TAG, "校准超时！已成功 %d/%d 次，使用默认零偏", n, GYRO_CALIB_SAMPLES);
+                if (n > 10)
+                    goto calib_done;  // 至少 10 次有效数据，勉强继续
+                else
+                {
+                    ESP_LOGE(TAG, "有效样本不足，系统暂停");
+                    vTaskSuspend(NULL);  // 挂起任务，避免无限重启
+                }
+            }
+
             if (bmi2_get_sensor_data(&sd, &g_bmi2_dev) != BMI2_OK)
+            {
+                fail_cnt++;
+                if (fail_cnt % 10 == 0)
+                    ESP_LOGW(TAG, "I2C 读取失败 %d 次", fail_cnt);
                 continue;
+            }
             if (!(sd.status & BMI2_DRDY_GYR))
                 continue;
 
@@ -677,13 +702,14 @@ static void imu_task(void *arg)
             sum_gz += lsb_to_dps(sd.gyr.z);
             n++;
         }
+calib_done:
         bias_gx = sum_gx / n;
         bias_gy = sum_gy / n;
         bias_gz = sum_gz / n;
     }
     ESP_LOGI(TAG, "校准完成  bias=(%.3f, %.3f, %.3f) °/s",
              bias_gx, bias_gy, bias_gz);
-    buzzer_beep_n(2, 50, 50);  // 校准完成: 嘀嘀两声
+    // buzzer_beep_n(2, 50, 50);  // 校准完成: 嘀嘀两声 (暂时禁用)
 
     /* 重置时间戳 */
     t_prev = esp_timer_get_time();
@@ -691,9 +717,16 @@ static void imu_task(void *arg)
     // =========================================================================
     // 阶段 B+C: 主循环  (100 Hz 内部, 50 Hz 输出)
     // =========================================================================
+    int main_loop_cnt = 0;
+    int i2c_fail_cnt = 0;
+    int drdy_fail_cnt = 0;
+
+    ESP_LOGI(TAG, ">>> 进入主循环");
+
     while (1)
     {
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(IMU_LOOP_PERIOD_MS));
+        main_loop_cnt++;
 
         /* ---- 计算真实 dt ---- */
         int64_t t_now = esp_timer_get_time();
@@ -705,9 +738,27 @@ static void imu_task(void *arg)
         /* ---- 读取传感器 ---- */
         struct bmi2_sens_data sd;
         if (bmi2_get_sensor_data(&sd, &g_bmi2_dev) != BMI2_OK)
+        {
+            i2c_fail_cnt++;
+            if (i2c_fail_cnt % 50 == 1)  // 每 50 次打印一次
+                ESP_LOGW(TAG, "I2C 读取失败 #%d", i2c_fail_cnt);
             continue;
+        }
         if (!((sd.status & BMI2_DRDY_ACC) && (sd.status & BMI2_DRDY_GYR)))
+        {
+            drdy_fail_cnt++;
+            if (drdy_fail_cnt % 50 == 1)
+                ESP_LOGW(TAG, "数据不就绪 #%d, status=0x%02X", drdy_fail_cnt, sd.status);
             continue;
+        }
+
+        /* 成功读取，重置计数器 */
+        if (i2c_fail_cnt > 0 || drdy_fail_cnt > 0)
+        {
+            ESP_LOGI(TAG, "恢复正常: I2C失败=%d, DRDY失败=%d", i2c_fail_cnt, drdy_fail_cnt);
+            i2c_fail_cnt = 0;
+            drdy_fail_cnt = 0;
+        }
 
         /* ---- LSB → 物理量 ---- */
         float ax = lsb_to_mps2(sd.acc.x);
@@ -847,9 +898,9 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "========== smartKeep 姿态节点启动 ==========");
 
-    /* 0. 蜂鸣器初始化 + 启动提示音 */
-    buzzer_init();
-    buzzer_beep(100);
+    /* 0. 蜂鸣器初始化 + 启动提示音 (暂时禁用) */
+    // buzzer_init();
+    // buzzer_beep(100);
 
     /* 1. NVS 初始化 (WiFi + 节点配置 依赖) */
     esp_err_t ret = nvs_flash_init();
@@ -863,6 +914,9 @@ void app_main(void)
     /* 2. 节点 ID 配置 (从 NVS 加载) */
     uint8_t nid = node_config_init();
     ESP_LOGI(TAG, "节点 ID: %d", nid);
+
+    /* 2.5 延迟等待电源稳定后再开启 WiFi */
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     /* 3. WiFi 连接 */
     bool wifi_ok = (wifi_sta_init() == ESP_OK);
@@ -881,40 +935,46 @@ void app_main(void)
     g_pkt_queue = xQueueCreate(PKT_QUEUE_DEPTH, sizeof(node_packet_t));
     if (!g_pkt_queue)
     {
-        ESP_LOGE(TAG, "队列创建失败");
-        return;
+        ESP_LOGE(TAG, "队列创建失败，系统暂停");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
 
     /* 6. 启动 UDP 发送任务 */
     if (xTaskCreate(udp_tx_task, "udp_tx", UDP_TASK_STACK, NULL,
                     UDP_TASK_PRIO, NULL) != pdPASS)
     {
-        ESP_LOGE(TAG, "创建 UDP 任务失败");
-        return;
+        ESP_LOGE(TAG, "创建 UDP 任务失败，系统暂停");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
 
     /* 7. I2C 互斥锁 */
     g_i2c_mutex = xSemaphoreCreateMutex();
     if (!g_i2c_mutex)
     {
-        ESP_LOGE(TAG, "互斥锁创建失败");
-        return;
+        ESP_LOGE(TAG, "互斥锁创建失败，系统暂停");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
 
     /* 8. I2C 总线 */
     if (i2c_bus_init() != ESP_OK)
-        return;
+    {
+        ESP_LOGE(TAG, "I2C 总线初始化失败，系统暂停");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
 
     /* 9. BMI270 初始化 + 配置 + 使能 */
     if (bmi270_hw_init() != BMI2_OK)
-        return;
+    {
+        ESP_LOGE(TAG, "BMI270 初始化失败，系统暂停");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
 
     /* 10. 启动 IMU 管道任务 */
     if (xTaskCreate(imu_task, "imu", IMU_TASK_STACK, NULL,
                     IMU_TASK_PRIO, NULL) != pdPASS)
     {
-        ESP_LOGE(TAG, "创建 IMU 任务失败");
-        return;
+        ESP_LOGE(TAG, "创建 IMU 任务失败，系统暂停");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
 
     ESP_LOGI(TAG, "系统就绪 — 节点%d IMU(50Hz) → UDP(%s:%d)",

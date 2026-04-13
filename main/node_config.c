@@ -183,5 +183,5 @@ static void node_cfg_udp_task(void *arg)
 
 void node_config_start_udp_listener(void)
 {
-    xTaskCreate(node_cfg_udp_task, "node_cfg", 2560, NULL, 3, NULL);
+    xTaskCreate(node_cfg_udp_task, "node_cfg", 4096, NULL, 3, NULL);
 }
